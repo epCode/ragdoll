@@ -18,17 +18,18 @@ local function hlen(v) return math.sqrt(v.x * v.x + v.z * v.z) end
 local function clamp(x, a, b) return x < a and a or (x > b and b or x) end
 local function gravity() return tonumber(core.settings:get("movement_gravity")) or 9.81 end
 
--- (the real server step: per-step braking depends on it)
-local step = 0.09
-core.register_globalstep(function(dtime) step = step * 0.95 + clamp(dtime, 0.01, 0.5) * 0.05 end)
+-- Some APIs brake a mob by a fixed factor every server step, so how far the
+-- mob itself would slide depends on the server's step. A throw never does:
+-- it's worked out as at 20 steps a second (the rate those games are made for).
+local REF_STEP = 0.05
 
 --------------------------------------------------------------------------------
 -- How far a game's movement carries a knocked-back mob
 --------------------------------------------------------------------------------
--- horizontal speed multiplied by `factor` every server step, for `duration`
+-- horizontal speed multiplied by `factor` every step (at REF_STEP), for `duration`
 local function travel_damped(vh, factor, duration)
-	local n = math.max(1, math.floor(duration / step))
-	return vh * step * (1 - factor ^ n) / (1 - factor)
+	local n = math.max(1, math.floor(duration / REF_STEP))
+	return vh * REF_STEP * (1 - factor ^ n) / (1 - factor)
 end
 
 -- Minecraft physics (Mineclonia): per 1/20 s tick, gravity 0.08 b/t, air drag
@@ -137,7 +138,7 @@ end
 -- VoxeLibre / MineClone2 (mcl_mobs): kb = 1.25 (or the tool's knockback
 -- group), + 3 for hammers, + half the attacker's run speed, x the swing's
 -- charge, + 3 per Knockback level, x 1.25 for a kill, x 20; 5.25 up. A dying
--- mob slides on, slowing x0.92 a step, for its 1.5 s death.
+-- mob slides on, slowing x0.92 a step (at 20 steps a second), for its 1.5 s death.
 function K.mcl_voxelibre(self, rec)
 	if not rec.dir then return nil end
 	if not self.knock_back then return NONE end

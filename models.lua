@@ -445,15 +445,30 @@ M.parse_gltf = parse_gltf
 --------------------------------------------------------------------------------
 -- Rig analysis
 --------------------------------------------------------------------------------
--- Name hints: how far a limb may swing from its rest direction (radians) and
--- how firmly it is held there.
+-- Name hints: how far a limb may bend from its rest direction (radians) -
+-- swing: in the body's front-back plane (a leg kicking, a head nodding);
+-- side: sideways (a leg splaying out, a head tilting) - and how firmly it is
+-- held there (tone). lower: the same for the next segment down the limb
+-- (knees, forearms, tail tips). Bending gets harder towards the limit (see
+-- body.lua), so bodies come to rest in poses a creature could hold.
 local HINTS = {
-	{"head", 0.75, 0.10}, {"neck", 0.6, 0.10}, {"skull", 0.75, 0.10}, {"jaw", 0.3, 0.2},
-	{"tail", 1.4, 0.02}, {"wing", 2.2, 0.01}, {"elytra", 0.8, 0.05, true}, {"elyra", 0.8, 0.05, true},
-	{"cape", 1.6, 0.0, true}, {"fin", 1.2, 0.02}, {"ear", 0.6, 0.08},
-	{"arm", 2.6, 0.0}, {"hand", 2.0, 0.0}, {"fore", 1.8, 0.0}, {"elbow", 1.8, 0.0},
-	{"leg", 1.7, 0.01}, {"thigh", 1.7, 0.01}, {"shin", 2.0, 0.01}, {"knee", 2.0, 0.01}, {"foot", 1.6, 0.01},
-	{"paw", 1.6, 0.01}, {"claw", 1.6, 0.01}, {"tentacle", 2.0, 0.0},
+	{"head", swing = 0.6, side = 0.4, tone = 0.10}, {"neck", swing = 0.45, side = 0.3, tone = 0.10},
+	{"skull", swing = 0.6, side = 0.4, tone = 0.10}, {"jaw", swing = 0.25, side = 0.08, tone = 0.2},
+	{"tail", swing = 0.9, side = 0.9, tone = 0.02, lower = {0.7, 0.7}},
+	{"wing", swing = 0.7, side = 1.3, tone = 0.01, lower = {0.6, 0.9}},
+	{"elytra", swing = 0.8, side = 0.8, tone = 0.05, cosmetic = true},
+	{"elyra", swing = 0.8, side = 0.8, tone = 0.05, cosmetic = true},
+	{"cape", swing = 1.6, side = 1.6, tone = 0.0, cosmetic = true},
+	{"fin", swing = 0.7, side = 0.7, tone = 0.02}, {"ear", swing = 0.5, side = 0.3, tone = 0.08},
+	{"arm", swing = 1.4, side = 0.9, tone = 0.0, lower = {1.0, 0.3}},
+	{"hand", swing = 0.8, side = 0.4, tone = 0.0}, {"fore", swing = 1.0, side = 0.3, tone = 0.0},
+	{"elbow", swing = 1.0, side = 0.3, tone = 0.0},
+	{"leg", swing = 0.9, side = 0.3, tone = 0.01, lower = {0.9, 0.15}},
+	{"thigh", swing = 0.9, side = 0.3, tone = 0.01, lower = {0.9, 0.15}},
+	{"shin", swing = 0.9, side = 0.15, tone = 0.01}, {"knee", swing = 0.9, side = 0.15, tone = 0.01},
+	{"foot", swing = 0.6, side = 0.3, tone = 0.01}, {"paw", swing = 0.6, side = 0.3, tone = 0.01},
+	{"claw", swing = 0.6, side = 0.3, tone = 0.01},
+	{"tentacle", swing = 1.2, side = 1.2, tone = 0.0, lower = {1.0, 1.0}},
 }
 
 -- the words in a bone name: "Front_Leg.R" -> front, leg, r; "HeadTop" -> head, top
@@ -470,7 +485,7 @@ local function hint(name)
 		for _, w in ipairs(ws) do
 			-- whole word, or its plural / a longer form (legs, wings, tails, forearm...)
 			if w == h[1] or (w:sub(1, #h[1]) == h[1] and #w <= #h[1] + 2) or (h[1] == "arm" and w == "forearm") then
-				return h[2], h[3], h[1], h[4]
+				return h
 			end
 		end
 	end
@@ -484,7 +499,7 @@ local function vlen(a) return math.sqrt(a[1] * a[1] + a[2] * a[2] + a[3] * a[3])
 --   core = {[bone name] = true}, box = {min = {x,y,z}, max = {x,y,z}} (model units),
 --   bounds = whole-model box,
 --   limbs = {{bone, pivot = {x,y,z}, dir = unit {x,y,z}, len, thick (half width), parent (limb index or nil),
---             rot = 3x3 global rest rotation (row-major), max_angle, tone}, ...},
+--             rot = 3x3 global rest rotation (row-major), max_angle (front-back), side_angle, tone}, ...},
 -- }
 function M.analyze(model)
 	local verts = model.verts
@@ -731,12 +746,15 @@ function M.analyze(model)
 			end
 			if hi1 >= lo1 and hi2 >= lo2 then thick = math.min(hi1 - lo1, hi2 - lo2) / 2 end
 		end
-		local max_angle, tone, kind, cosmetic = hint(n.name)
-		if not max_angle then
+		local h = hint(n.name)
+		if not h then
 			-- unnamed: pointing up = a head/neck (stiff), else a leg-like limb
-			if dir[2] > 0.6 then max_angle, tone, kind = 0.7, 0.08, "head"
-			else max_angle, tone, kind = 1.6, 0.01, "limb" end
+			if dir[2] > 0.6 then h = {"head", swing = 0.5, side = 0.35, tone = 0.08}
+			else h = {"limb", swing = 1.0, side = 0.45, tone = 0.01, lower = {0.9, 0.3}} end
 		end
+		local kind, tone, cosmetic = h[1], h.tone, h.cosmetic
+		local max_angle, side_angle = h.swing, h.side
+		if parent_limb and h.lower then max_angle, side_angle = h.lower[1], h.lower[2] end
 		local par = n.parent
 		-- an overlay bone sitting exactly on another limb (armor on an arm):
 		-- it moves with that limb instead of on its own
@@ -753,7 +771,7 @@ function M.analyze(model)
 		end
 		local limb = {bone = n.name, pivot = pv, dir = dir, len = len, thick = thick, rot = mat_rot3(n.global),
 			lrot = mat_rot3(n.local_m), prot = par and mat_rot3(par.global) or {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}},
-			parent = parent_limb, max_angle = max_angle, tone = tone, kind = kind, nverts = #vs,
+			parent = parent_limb, max_angle = max_angle, side_angle = side_angle, tone = tone, kind = kind, nverts = #vs,
 			ghost = cosmetic or nil}   -- (capes, elytra: often hidden; never hold the body up)
 		rig.limbs[#rig.limbs + 1] = limb
 		limb_set[n] = true

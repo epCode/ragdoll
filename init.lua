@@ -15,7 +15,7 @@ local modpath = core.get_modpath(core.get_current_modname())
 -- Settings (re-read every few seconds)
 --------------------------------------------------------------------------------
 local DEFAULTS = {players = true, mobs = true, lifetime = 15, max = 30, despawn = "fade", impulse = 0.25, spin = 1,
-	flash = true, blast = 1.5}
+	flash = true, blast = 1.5, joint_range = 1, joint_stiffness = 1}
 local cache, cache_t = {}, -1
 function R.setting(key, default)
 	if cache[key] == nil then

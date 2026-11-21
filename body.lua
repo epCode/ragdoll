@@ -19,6 +19,14 @@ local FRICTION = 0.74               -- horizontal velocity kept per substep whil
 local LIMB_FRICTION = 0.91          -- (limb ends slide more easily: limp limbs splay)
 local LIMB_DAMP = 0.935             -- limb swing kept per substep
 local BOUNCE = 0.25
+-- Joints: free in the inner part of their range; beyond SOFT (a fraction of
+-- the limit) they get stiffer and stiffer up to the hard limit - a growing
+-- friction in the joint: the swing is braked, and a slow one stops dead (it
+-- holds its own weight there). Friction only takes energy away, so limbs
+-- always come to rest.
+local SOFT = 0.4
+local SOFT_BRAKE = 0.5               -- swing lost per substep, at the limit
+local SOFT_HOLD = 0.045              -- swing (nodes per substep) the joint stops dead, at the limit
 local function gravity() return -2 * (tonumber(core.settings:get("movement_gravity")) or 9.81) end
 
 local bodies = {}
@@ -418,6 +426,88 @@ local function rigidify(b)
 	end
 end
 
+-- how fast a limb's pivot is moving (its parent limb's end, or the torso there)
+local function pivot_vel(b, L)
+	local P = b.pts
+	if L.parent then
+		local pp = P[b.limbs[L.parent].tip]
+		return sub(pp.x, pp.p)
+	end
+	local vp = v(0, 0, 0)
+	for i = 1, 8 do
+		local w = L.w[i]
+		if w > 0 then vp = add(vp, mul(sub(P[i].x, P[i].p), w)) end
+	end
+	return vp
+end
+
+-- Friction in a stiff joint (f: 0 free .. 1 at the limit): the limb's swing
+-- about its pivot is braked, and a slow one stops dead - it takes more to start
+-- a stiff joint moving than to keep it moving.
+local function joint_friction(b, L, tip, d, f)
+	local vp = pivot_vel(b, L)
+	local vrel = sub(sub(tip.x, tip.p), vp)
+	local swing = sub(vrel, mul(d, dot(vrel, d)))
+	local sp = len(swing)
+	local hold = f * SOFT_HOLD
+	if sp <= hold * 1.6 then
+		vrel = sub(vrel, swing)
+	else
+		local keep = (1 - math.min(1, f * SOFT_BRAKE)) * (1 - hold / sp)
+		vrel = sub(vrel, mul(swing, 1 - keep))
+	end
+	tip.p = sub(tip.x, add(vp, vrel))
+end
+
+-- How far a limb may bend the way it's bending: its front-back range and its
+-- sideways range make an ellipse around the rest direction (in the body's
+-- frame: front-back is the plane of the body's forward axis, or of its up axis
+-- for limbs that point forward or back - heads on long necks, tails).
+local function bend_limit(L, rest, d, up, fwd, range)
+	local swing, side = L.max_angle * range, (L.side_angle or L.max_angle) * range
+	local perp = sub(d, mul(rest, dot(d, rest)))
+	local pl = len(perp)
+	if pl < 1e-6 or math.abs(swing - side) < 1e-6 then return swing, pl > 1e-6 and mul(perp, 1 / pl) or nil end
+	local u = mul(perp, 1 / pl)
+	local f = sub(fwd, mul(rest, dot(fwd, rest)))
+	if len(f) < 0.3 then f = sub(up, mul(rest, dot(up, rest))) end
+	f = norm(f)
+	local l = cross(rest, f)
+	local c1, c2 = dot(u, f) / swing, dot(u, l) / side
+	return 1 / math.sqrt(c1 * c1 + c2 * c2), u
+end
+
+-- A limb whose rest direction is in the ground (the legs of an animal lying
+-- on its belly): the least-bent direction it can point without going through
+-- the ground - legs fold forward or back, not out sideways. nil: no need.
+local function floor_of(tip)
+	if tip.cn and tip.cn.y >= 0.55 then return tip.cp, tip.cn end
+	if tip.cn2 and tip.cn2.y >= 0.55 then return tip.cp2, tip.cn2 end
+	return nil
+end
+
+local function ground_target(L, piv, tip, rest, d, up, fwd, range)
+	local cp, n = floor_of(tip)
+	if not cp then return nil end
+	local hp = dot(sub(piv, cp), n)
+	local m = clamp((tip.r - hp) / math.max(L.len, 1e-3), -1, 1)
+	if dot(rest, n) >= m - 0.02 then return nil end
+	local t1 = norm(math.abs(n.y) < 0.9 and cross(n, v(0, 1, 0)) or cross(n, v(1, 0, 0)))
+	local t2 = cross(n, t1)
+	local rad = math.sqrt(math.max(0, 1 - m * m))
+	local best, bs, bd
+	for i = 0, 15 do
+		local a = i * math.pi / 8
+		local dir = add(mul(n, m), mul(add(mul(t1, math.cos(a)), mul(t2, math.sin(a))), rad))
+		local lim = bend_limit(L, rest, dir, up, fwd, range)
+		local sv = math.acos(clamp(dot(dir, rest), -1, 1)) / math.max(lim, 1e-3)
+		local near = dot(dir, d)
+		-- (the least bent; between two about as good, the nearer)
+		if not best or sv < bs * 0.95 or (sv < bs * 1.05 and near > bd) then best, bs, bd = dir, sv, near end
+	end
+	return best
+end
+
 -- the direction a limb hangs at rest, now (follows the torso, and the limb above)
 local function rest_dir(b, L, right, up, fwd)
 	local P = b.pts
@@ -468,7 +558,9 @@ local function step(b, dt)
 			local l = len(d)
 			if l > 1e-9 then
 				local corr = mul(d, (l - L.len) / l)
-				if L.parent and not L.ghost then
+				-- (unless the limb above is at its limit: a joint bent all the
+				-- way is locked, the one below can't drag it further)
+				if L.parent and not L.ghost and not b.limbs[L.parent].at_limit then
 					local pp = P[b.limbs[L.parent].tip]
 					tip.x = sub(tip.x, mul(corr, 0.7))
 					pp.x = add(pp.x, mul(corr, 0.3))
@@ -482,34 +574,69 @@ local function step(b, dt)
 			if not pt.ghost then catch_overlap(pt, home) end
 		end
 	end
-	-- joint limits and muscle tone
+	-- joint limits: a hard one, and growing resistance on the way to it
 	if #b.limbs > 0 then
 		local right, up, fwd = frame(b)
+		local range, stiff = R.setting("joint_range", 1), R.setting("joint_stiffness", 1)
 		for _, L in ipairs(b.limbs) do
 			local tip = P[L.tip]
 			local piv = pivot_of(b, L)
 			local rest = norm(rest_dir(b, L, right, up, fwd))
 			local d = norm(sub(tip.x, piv))
 			local ang = math.acos(clamp(dot(d, rest), -1, 1))
-			local limit = L.max_angle
-			if tip.ground and dot(sub(rest, d), tip.cn2 or tip.cn or v(0, 1, 0)) < 0 then
-				-- (resting on the ground and the limit would push it into it:
-				-- the ground is the limit)
-			elseif ang > limit then
-				-- past the joint's limit: back onto it, losing most of the swing
-				local nx = add(piv, mul(swing_toward(d, rest, ang - limit), L.len))
-				local delta = sub(nx, tip.x)
-				local vel = sub(tip.x, tip.p)
-				tip.x = nx
-				-- (the speed out past the limit is gone - kept, a limb held
-				-- on its limit would carry a speed it never has, and the limb
-				-- below, damped toward it, would slide along forever)
-				local dn, dl = norm(delta)
-				if dl > 1e-9 then
-					local vn = dot(vel, dn)
-					if vn < 0 then vel = sub(vel, mul(dn, vn)) end
+			local limit, u = bend_limit(L, rest, d, up, fwd, range)
+			if L.ghost then limit, u = L.max_angle, nil end
+			local s = ang / math.max(limit, 1e-3)
+			L.at_limit = ang > limit and not L.ghost
+			-- (would the limb, pointing that way, be in the floor under it - or
+			-- in any solid node, the floor unseen when it's already sunk in?)
+			local fp, fn = floor_of(tip)
+			local function in_floor(dir)
+				local t = add(piv, mul(dir, L.len))
+				if fp and dot(sub(t, fp), fn) < tip.r - 0.01 then return true end
+				return solid_at(t) ~= nil
+			end
+			-- where the rest pose is out of reach below the ground, the limb is
+			-- drawn round to the least bent way it can lie there instead
+			local function lie(gently)
+				local best = not L.ghost and ground_target(L, piv, tip, rest, d, up, fwd, range)
+				if not best then return end
+				local off = math.acos(clamp(dot(d, best), -1, 1))
+				if off > 0.03 then
+					local nx = add(piv, mul(swing_toward(d, best, off * gently), L.len))
+					tip.p = add(tip.p, sub(nx, tip.x))
+					tip.x = nx
 				end
-				tip.p = sub(tip.x, mul(vel, 0.4))
+			end
+			local gently = 0.2 * math.max(stiff, 0.2)
+			if tip.ground and dot(sub(rest, d), tip.cn2 or tip.cn or v(0, 1, 0)) < 0 then
+				-- resting on the ground, and the joint would push it into it
+				lie(gently)
+			elseif ang > limit then
+				local tdir = swing_toward(d, rest, ang - limit)
+				if in_floor(tdir) then
+					lie(gently)
+				else
+					-- past the joint's limit: back onto it, losing most of the swing
+					local nx = add(piv, mul(tdir, L.len))
+					local delta = sub(nx, tip.x)
+					local vel = sub(tip.x, tip.p)
+					tip.x = nx
+					-- (the speed out past the limit is gone - kept, a limb held
+					-- on its limit would carry a speed it never has, and the limb
+					-- below, damped toward it, would slide along forever)
+					local dn, dl = norm(delta)
+					if dl > 1e-9 then
+						local vn = dot(vel, dn)
+						if vn < 0 then vel = sub(vel, mul(dn, vn)) end
+					end
+					tip.p = sub(tip.x, mul(vel, 0.4))
+					-- (and at its stiffest: no sliding round the edge of its range)
+					if stiff > 0 and not L.ghost then joint_friction(b, L, tip, tdir, stiff) end
+				end
+			elseif s > SOFT and stiff > 0 and u and not L.ghost then
+				-- bent far: stiffer the farther (quadratic from SOFT to the limit)
+				joint_friction(b, L, tip, d, ((s - SOFT) / (1 - SOFT)) ^ 2 * stiff)
 			elseif L.tone > 0 and not L.parent and ang > 0.02 and not tip.ground
 					and not (L.child and P[b.limbs[L.child].tip].ground) then
 				-- (root limbs only: tone down a chain feeds back on itself; and
@@ -527,17 +654,7 @@ local function step(b, dt)
 	-- what it hangs from, so a flying body isn't slowed)
 	for _, L in ipairs(b.limbs) do
 		local tip = P[L.tip]
-		local vp
-		if L.parent then
-			local pp = P[b.limbs[L.parent].tip]
-			vp = sub(pp.x, pp.p)
-		else
-			vp = v(0, 0, 0)
-			for i = 1, 8 do
-				local w = L.w[i]
-				if w > 0 then vp = add(vp, mul(sub(P[i].x, P[i].p), w)) end
-			end
-		end
+		local vp = pivot_vel(b, L)
 		local vt = sub(tip.x, tip.p)
 		tip.p = sub(tip.x, add(vp, mul(sub(vt, vp), LIMB_DAMP)))
 	end
@@ -774,8 +891,14 @@ function R.build(obj, snap)
 				if ll > 0.02 then
 					local rot = l.rot
 					local L = {bone = l.bone, pivot_l = piv, dir_l = dl, len = ll, dir_m = v(l.dir[1], l.dir[2], l.dir[3]),
-						rot = rot, rot_t = m3_t(rot), lrot = l.lrot, prot = l.prot, prot_t = m3_t(l.prot), max_angle = (prof.max_angle and prof.max_angle[l.bone]) or l.max_angle,
+						rot = rot, rot_t = m3_t(rot), lrot = l.lrot, prot = l.prot, prot_t = m3_t(l.prot), max_angle = l.max_angle, side_angle = l.side_angle or l.max_angle,
 						tone = l.tone or 0, tip = #b.pts + 1, ghost = l.ghost}
+					-- (a profile's max_angle caps the bone's range both ways)
+					local cap = prof.max_angle and tonumber(prof.max_angle[l.bone])
+					if cap then
+						local k = cap / math.max(L.max_angle, 1e-3)
+						L.max_angle, L.side_angle = cap, L.side_angle * k
+					end
 					if l.parent then
 						L.parent = tips_l[l.parent]
 						local pl = b.limbs[L.parent]
