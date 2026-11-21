@@ -1,0 +1,23 @@
+# Ragdolls for players who die (the real body is hidden until respawn).
+ragdolls_players (Ragdolls for players) bool true
+
+# Ragdolls for mobs and other creatures.
+ragdolls_mobs (Ragdolls for mobs) bool true
+
+# Seconds a body stays before it goes. 0 = until there are too many.
+ragdolls_lifetime (Body lifetime) float 15 0 600
+
+# Most bodies at once (the oldest goes first).
+ragdolls_max (Most bodies at once) int 30 1 300
+
+# How a body goes: fade away, a puff of smoke, or just vanish.
+ragdolls_despawn (How bodies go) enum fade fade,poof,vanish
+
+# How hard the killing hit throws the body.
+ragdolls_impulse (Hit strength) float 1 0 5
+
+# How much bodies tumble as they fall.
+ragdolls_spin (Tumble) float 1 0 5
+
+# A short red flash on the body at death.
+ragdolls_flash (Red flash) bool true
