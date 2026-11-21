@@ -9,7 +9,7 @@
 -- so slabs, stairs and nodeboxes work). Every server step the simulation
 -- drives the copy of the model: the entity follows the torso box, each limb
 -- bone gets the rotation that turns its rest direction into its simulated one.
-local R = ragdolls
+local R = ragdoll
 local models = R.models
 
 local SUB = 1 / 30                  -- simulation substep (s)
@@ -23,7 +23,7 @@ local function gravity() return -2 * (tonumber(core.settings:get("movement_gravi
 
 local bodies = {}
 R.bodies = bodies
-R.stats = {us = 0, frames = 0}      -- Lua time spent simulating (for /ragdolls)
+R.stats = {us = 0, frames = 0}      -- Lua time spent simulating (for /ragdoll)
 
 --------------------------------------------------------------------------------
 -- Vector / matrix helpers (plain tables, x y z fields)
@@ -549,7 +549,7 @@ local function step(b, dt)
 	-- no standing corpses: a limp body can't balance on end (its spine would
 	-- give). Resting with its long axis upright, it gets a firm shove over its
 	-- thinnest side (a few tries at most).
-	if grounded > 0 and b.elongated and b.t > 0.4 and (b.kicks or 0) < 4 and b.t >= (b.next_kick or 0)
+	if grounded > 0 and b.elongated and b.t - (b.woke or 0) > 0.4 and (b.kicks or 0) < 4 and b.t >= (b.next_kick or 0)
 			then
 		local axes = {frame(b)}
 		local axis = axes[b.long_axis]
@@ -592,6 +592,15 @@ end
 --------------------------------------------------------------------------------
 -- Rendering
 --------------------------------------------------------------------------------
+-- a bone, and its copies in models with the skeleton once per mesh
+local function set_bone(b, bone, override)
+	b.obj:set_bone_override(bone, override)
+	local others = b.bone_aliases and b.bone_aliases[bone]
+	if others then
+		for _, name in ipairs(others) do b.obj:set_bone_override(name, override) end
+	end
+end
+
 local function render(b, interp)
 	local obj = b.obj
 	local right, up, fwd, center = frame(b)
@@ -637,7 +646,7 @@ local function render(b, interp)
 		local last = L.sent
 		if not last or math.abs(last.x - e.x) + math.abs(last.y - e.y) + math.abs(last.z - e.z) > 0.01 then
 			L.sent = e
-			obj:set_bone_override(L.bone, {rotation = {vec = e, absolute = true, interpolation = interp}})
+			set_bone(b, L.bone, {rotation = {vec = e, absolute = true, interpolation = interp}})
 		end
 	end
 	for _, F in ipairs(b.followers or {}) do
@@ -647,7 +656,7 @@ local function render(b, interp)
 			local last = F.sent
 			if not last or math.abs(last.x - e.x) + math.abs(last.y - e.y) + math.abs(last.z - e.z) > 0.01 then
 				F.sent = e
-				obj:set_bone_override(F.bone, {rotation = {vec = e, absolute = true, interpolation = interp}})
+				set_bone(b, F.bone, {rotation = {vec = e, absolute = true, interpolation = interp}})
 			end
 		end
 	end
@@ -706,6 +715,8 @@ function R.build(obj, snap)
 		end
 	end
 	local b = {obj = obj, pts = {}, limbs = {}, scale = scale, t = 0, acc = 0, quiet = 0}
+	local alias = props.mesh and R.mesh_aliases and R.mesh_aliases[props.mesh]
+	b.bone_aliases = alias and alias.bones
 	b.center_l = mul(add(bmin, bmax), 0.5)
 	local right, up, fwd = axes_from_rot(snap.rot or v(0, 0, 0))
 	local pos = snap.pos
@@ -842,19 +853,51 @@ function R.build(obj, snap)
 			end
 		end
 	end
-	-- initial motion: the body's own velocity, the killing hit, a tumble
+	-- initial motion: the body's own velocity, the knockback of the killing
+	-- hit (the game's own, see knockback.lua, or a guess from the damage), a
+	-- blast that killed it, a tumble
 	local vel = snap.vel or v(0, 0, 0)
 	local hit = snap.hit or {}
-	local power = math.min(tonumber(hit.power) or 0, 14) * R.setting("impulse", 1)
-	local hdir = hit.dir and len(hit.dir) > 1e-3 and norm(hit.dir) or nil
+	local scale = R.setting("impulse", 1)
+	local blasts = snap.blasts or {}
+	local push, power, hdir     -- push: every point's share of the knockback
+	if #blasts > 0 then
+		-- (thrown by the blast below; what the game set on the mob is part of it)
+		vel, power = v(0, 0, 0), 0
+	elseif snap.kb and R.knockback then
+		push = R.knockback.launch(snap.kb, scale)
+		power = len(push)
+		hdir = power > 1e-3 and norm(push) or nil
+		-- what it was doing apart from the knockback (the game may already have
+		-- given it: then it's in the velocity it carries)
+		if snap.kb.applied then
+			vel = sub(vel, snap.kb.vel)
+			if hdir then
+				local along = dot(vel, hdir)
+				if along < 0 then vel = sub(vel, mul(hdir, along)) end
+			end
+		end
+		local sp = len(vel)
+		if sp > 5 then vel = mul(vel, 5 / sp) end
+	else
+		power = math.min(tonumber(hit.power) or 0, 14) * scale
+		hdir = hit.dir and len(hit.dir) > 1e-3 and norm(hit.dir) or nil
+		-- (the mob API may already have knocked it back: cap what it carries
+		-- in, and let the hit only add what the body isn't already doing)
+		local sp = len(vel)
+		if sp > 6 then vel = mul(vel, 6 / sp) end
+		local extra = power
+		if hdir then extra = math.max(0, power - math.max(0, dot(vel, hdir))) end
+		push = mul(hdir or v(0, 0, 0), extra)
+	end
 	local flat = hdir and norm(v(hdir.x, 0, hdir.z))
-	if not flat or (flat.x == 0 and flat.z == 0) or not hdir then
+	if not flat or (flat.x == 0 and flat.z == 0) then
 		local a = math.random() * math.pi * 2
 		flat = v(math.cos(a), 0, math.sin(a))
 	end
 	local h, w, d = bmax.y - bmin.y, bmax.x - bmin.x, bmax.z - bmin.z
 	local spin
-	local mag = (1.6 + math.random() * 1.0 + power * 0.3) * R.setting("spin", 1)
+	local mag = (1.6 + math.random() * 1.0 + math.min(power, 14) * 0.3) * R.setting("spin", 1)
 	-- (upright creatures - people, zombies - have a tall, narrow collisionbox)
 	local cbw = math.max(cb[4] - cb[1], cb[6] - cb[3], 0.1)
 	if (cb[5] - cb[2]) > cbw * 1.6 or h > math.max(w, d) * 1.2 then
@@ -866,20 +909,16 @@ function R.build(obj, snap)
 		spin = mul(fwd, -mag * side)
 	end
 	local center = world(b.center_l)
-	-- (the mob API may already have knocked it back: cap what it carries in,
-	-- and let the hit only add what the body isn't already doing)
-	local sp = len(vel)
-	if sp > 6 then vel = mul(vel, 6 / sp) end
-	local extra = power
-	if hdir then extra = math.max(0, power - math.max(0, dot(vel, hdir))) end
 	for i, pt in ipairs(b.pts) do
 		local wgt = i <= 8 and 1 or 0.8
-		local iv = add(mul(vel, 0.9), mul(hdir or v(0, 0, 0), extra * wgt))
+		local iv = add(mul(vel, 0.9), mul(push or v(0, 0, 0), wgt))
 		if hit.splash then iv.y = iv.y + power * 0.5 * wgt end
 		iv = add(iv, cross(spin, sub(pt.x, center)))
 		iv = add(iv, v((math.random() - 0.5) * 0.4, math.random() * 0.2, (math.random() - 0.5) * 0.4))
 		pt.p = sub(pt.x, mul(iv, SUB))
 	end
+	b.is_player = snap.is_player
+	for _, bl in ipairs(blasts) do R._internal.blast_body(b, bl, false) end
 	return b
 end
 
@@ -1020,7 +1059,8 @@ core.register_globalstep(function(dtime)
 					else
 						moved = 1
 					end
-					if (b.t > 1.2 and moved < 0.02) or b.t > 8 then b.asleep = true end
+					local awake_for = b.t - (b.woke or 0)
+					if (awake_for > 1.2 and moved < 0.02) or awake_for > 8 then b.asleep = true end
 					b.snap_pts = {}
 					for k, pt in ipairs(b.pts) do b.snap_pts[k] = v(pt.x.x, pt.x.y, pt.x.z) end
 					b.quiet = 0
@@ -1032,8 +1072,35 @@ core.register_globalstep(function(dtime)
 	R.stats.frames = R.stats.frames + 1
 end)
 
+-- A blast throws a body: each point away from the blast, the near side
+-- harder (so it tumbles away), as hard as the game's explosion would throw
+-- the creature. A body already lying there needs a clear line to the blast.
+local function blast_body(b, bl, existing)
+	b.blasted = b.blasted or {}
+	if b.blasted[bl] then return end
+	local _, _, _, c = frame(b)
+	local launch = R.knockback and R.knockback.blast_launch(bl, c, b.is_player)
+	if not launch then return end
+	if existing then
+		local ok, clear = pcall(core.line_of_sight, bl.pos, c)
+		if ok and clear == false then
+			-- (a corner of it may still stick out: try just above)
+			local ok2, clear2 = pcall(core.line_of_sight, vector.offset(bl.pos, 0, 0.5, 0), vector.offset(c, 0, 0.4, 0))
+			if not (ok2 and clear2) then return end
+		end
+	end
+	b.blasted[bl] = true
+	local dc = math.max(0.5, len(sub(c, bl.pos)))
+	for _, pt in ipairs(b.pts) do
+		local k = clamp(dc / math.max(0.5, len(sub(pt.x, bl.pos))), 0.7, 1.5)
+		pt.p = sub(pt.p, mul(launch, k * SUB))
+	end
+	-- (awake again, if it had settled)
+	b.asleep, b.quiet, b.snap_pts, b.woke, b.kicks = false, 0, nil, b.t, 0
+end
+
 R._internal = {step = function(b, dt) return step(b, dt or SUB) end, render = function(b, i) return render(b, i or 0) end,
-	frame = function(b) return frame(b) end, SUB = SUB, solid_at = solid_at, FADE = FADE}
+	frame = function(b) return frame(b) end, SUB = SUB, solid_at = solid_at, FADE = FADE, blast_body = blast_body}
 
 -- Where a ragdoll's body is (for death cams and the like), or nil once it's gone.
 function R.body_pos(obj)

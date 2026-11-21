@@ -1,7 +1,7 @@
 -- Hooks into the mob APIs. Each one keeps everything the API does at death
 -- (drops, xp, sounds, callbacks, kill credit) and replaces only the visual
 -- part: the death animation, tipping over, fading, smoke - with a ragdoll.
-local R = ragdolls
+local R = ragdoll
 
 local function mod(name) return core.get_modpath(name) ~= nil end
 
@@ -19,18 +19,30 @@ local function stand_frame(le)
 end
 R.stand_frame = stand_frame
 
-local function is_api_mob(def) return def and rawget(def, "_ragdolls_api") end
+local function is_api_mob(def) return def and rawget(def, "_ragdoll_api") end
+
+-- The game's own knockback for the hit that killed `self` (see knockback.lua):
+-- fn(self, hit) for a hit no older than `age` seconds.
+local K = R.knockback
+local function knockback(self, fn, age)
+	local rec = R.recent_hit(self.object)
+	if not rec or core.get_us_time() - rec.t > (age or 1.5) * 1e6 then return nil end
+	local ok, kb = pcall(fn, self, rec)
+	if ok then return kb end
+	core.log("warning", "[ragdoll] knockback: " .. tostring(kb))
+	return nil
+end
 
 core.register_on_mods_loaded(function()
 	----------------------------------------------------------------------------
 	-- Every entity: remember the punch that might kill it (direction, strength)
 	----------------------------------------------------------------------------
 	for name, def in pairs(core.registered_entities) do
-		if not name:find("^ragdolls:") and not name:find("^__builtin") then
+		if not name:find("^ragdoll:") and not name:find("^__builtin") then
 			local own = rawget(def, "on_punch")
 			local mt = getmetatable(def)
 			def.on_punch = function(self, puncher, tflp, caps, dir, damage, ...)
-				if dir and self.object then R.note_hit(self.object, dir, damage, caps) end
+				if dir and self.object then R.note_hit(self.object, dir, damage, caps, puncher, tflp) end
 				local f = own
 				if not f then
 					local idx = mt and mt.__index
@@ -48,23 +60,26 @@ core.register_on_mods_loaded(function()
 	if mobs and type(mobs.mob_class) == "table" and mobs.mob_class.check_for_death then
 		local mc = mobs.mob_class
 		local orig_check, orig_anim = mc.check_for_death, mc.death_anim
+		-- (beside the mob, not on it: Mobs Redo saves every field of a mob)
+		local pending = setmetatable({}, {__mode = "k"})
 		mc.check_for_death = function(self, cause, ...)
 			local snap
 			if self.state ~= "die" and (self.health or 1) <= 0 and not self._ragdolled and R.enabled_for(self) then
-				snap = R.snapshot(self.object, {frame = stand_frame(self), texture_mod = self.texture_mods})
+				local kb = type(cause) == "table" and cause.type == "punch" and knockback(self, K.mobs_redo, 0.3) or nil
+				snap = R.snapshot(self.object, {frame = stand_frame(self), texture_mod = self.texture_mods, kb = kb})
 			end
-			self._ragdolls_snap = snap
+			pending[self] = snap
 			local r = orig_check(self, cause, ...)
 			-- gone already (its on_die / on_death removed it): the body falls now
 			if snap and not self._ragdolled and not self.object:get_pos() then
 				self._ragdolled = true
 				R.spawn(snap)
 			end
-			self._ragdolls_snap = nil
+			pending[self] = nil
 			return r
 		end
 		mc.death_anim = function(self, ...)
-			local snap = self._ragdolls_snap
+			local snap = pending[self]
 			if snap and not self._ragdolled then
 				self._ragdolled = true
 				R.spawn(snap, self.object)
@@ -75,9 +90,9 @@ core.register_on_mods_loaded(function()
 		end
 		for _, def in pairs(core.registered_entities) do
 			local mt = getmetatable(def)
-			if mt and mt.__index == mc then def._ragdolls_api = true end
+			if mt and mt.__index == mc then def._ragdoll_api = true end
 		end
-		core.log("action", "[ragdolls] hooked Mobs Redo")
+		core.log("action", "[ragdoll] hooked Mobs Redo")
 	end
 
 	----------------------------------------------------------------------------
@@ -88,11 +103,15 @@ core.register_on_mods_loaded(function()
 		local mc = mcl_mobs.mob_class
 		local orig = mc.check_for_death
 		local quiet = false
+		local mcl_util = rawget(_G, "mcl_util")
+		local mineclonia = mc.apply_knockback ~= nil and mcl_util and mcl_util.calculate_knockback ~= nil
 		mc.check_for_death = function(self, ...)
 			local dying = (self.health or 1) <= 0 and self.state ~= "die" and not self.dead and not self._ragdolled
 				and R.enabled_for(self)
 			if not dying then return orig(self, ...) end
-			local snap = R.snapshot(self.object, {frame = stand_frame(self), strip = "^[colorize:#d42222:175"})
+			-- (Mineclonia knocks back the Minecraft way, VoxeLibre its own)
+			local kb = knockback(self, mineclonia and K.mcl_mineclonia or K.mcl_voxelibre, 0.3)
+			local snap = R.snapshot(self.object, {frame = stand_frame(self), strip = "^[colorize:#d42222:175", kb = kb})
 			-- an instant death: drops, xp, sounds and callbacks now, no tipping over
 			local had = rawget(self, "instant_death")
 			self.instant_death = true
@@ -118,9 +137,9 @@ core.register_on_mods_loaded(function()
 		end
 		for _, def in pairs(core.registered_entities) do
 			local mt = getmetatable(def)
-			if mt and mt.__index == mc then def._ragdolls_api = true end
+			if mt and mt.__index == mc then def._ragdoll_api = true end
 		end
-		core.log("action", "[ragdolls] hooked mcl_mobs")
+		core.log("action", "[ragdoll] hooked mcl_mobs")
 	end
 
 	----------------------------------------------------------------------------
@@ -133,7 +152,7 @@ core.register_on_mods_loaded(function()
 		mob_core.on_die = function(self, ...)
 			if self._ragdolled or not R.enabled_for(self) then return orig(self, ...) end
 			self._ragdolled = true
-			local snap = R.snapshot(self.object, {frame = stand_frame(self)})
+			local snap = R.snapshot(self.object, {frame = stand_frame(self), kb = knockback(self, K.mob_core)})
 			if self.driver and mob_core.force_detach then mob_core.force_detach(self.driver) end
 			self.owner = nil
 			if self.sounds and self.sounds.death and mob_core.make_sound then mob_core.make_sound(self, "death") end
@@ -147,7 +166,7 @@ core.register_on_mods_loaded(function()
 				return true
 			end, 100)
 		end
-		core.log("action", "[ragdolls] hooked mob_core")
+		core.log("action", "[ragdoll] hooked mob_core")
 	end
 
 	----------------------------------------------------------------------------
@@ -168,9 +187,9 @@ core.register_on_mods_loaded(function()
 			end, 100)
 		end
 		for _, def in pairs(core.registered_entities) do
-			if def.on_step == mobkit.stepfunc then def._ragdolls_api = true end
+			if def.on_step == mobkit.stepfunc then def._ragdoll_api = true end
 		end
-		core.log("action", "[ragdolls] hooked mobkit")
+		core.log("action", "[ragdoll] hooked mobkit")
 	end
 
 	----------------------------------------------------------------------------
@@ -182,7 +201,7 @@ core.register_on_mods_loaded(function()
 		if creatura.registered_utilities and creatura.registered_utilities["animalia:die"] then
 			creatura.register_utility("animalia:die", function(self)
 				local snap = not self._ragdolled and R.enabled_for(self)
-					and R.snapshot(self.object, {frame = stand_frame(self)}) or nil
+					and R.snapshot(self.object, {frame = stand_frame(self), kb = knockback(self, K.creatura)}) or nil
 				self:set_utility(function(m)
 					local pos = m.object:get_pos()
 					if not pos then return end
@@ -208,7 +227,7 @@ core.register_on_mods_loaded(function()
 			creatura.action_fallover = function(self, ...)
 				if not self._ragdolled and R.enabled_for(self) then
 					self._ragdolled = true
-					R.spawn_from(self.object, {frame = stand_frame(self)})
+					R.spawn_from(self.object, {frame = stand_frame(self), kb = knockback(self, K.creatura)})
 					R.hide_object(self.object)
 				end
 				return orig(self, ...)
@@ -217,9 +236,9 @@ core.register_on_mods_loaded(function()
 		for _, def in pairs(core.registered_entities) do
 			local mt = getmetatable(def)
 			local idx = mt and mt.__index
-			if type(idx) == "table" and rawget(idx, "_execute_utilities") then def._ragdolls_api = true end
+			if type(idx) == "table" and rawget(idx, "_execute_utilities") then def._ragdoll_api = true end
 		end
-		core.log("action", "[ragdolls] hooked Creatura")
+		core.log("action", "[ragdoll] hooked Creatura")
 	end
 
 	----------------------------------------------------------------------------
@@ -236,19 +255,77 @@ core.register_on_mods_loaded(function()
 						return orig_die(self, cause, source, ...)
 					end
 					local o = self.object
-					local snap = R.snapshot(o, {frame = stand_frame(self.def or self)})
+					local snap = R.snapshot(o, {frame = stand_frame(self.def or self), kb = knockback(self, K.all_mobs_api)})
 					local r = orig_die(self, cause, source, ...)    -- goals, sound, on_death, drops
 					if o:get_pos() and not self._ragdolled then
 						self._ragdolled = true
 						R.spawn(snap, o)
-						o:remove()
+						-- (die() can run in the middle of the mob's own step, which
+						-- carries on using the object: hidden now, gone next step)
+						R.hide_object(o)
+						core.after(0, function() if o:is_valid() then o:remove() end end)
 					end
 					return r
 				end
-				proto._ragdolls_api = true
+				proto._ragdoll_api = true
 			end
 		end
-		core.log("action", "[ragdolls] hooked all_mobs_api")
+		core.log("action", "[ragdoll] hooked all_mobs_api")
+	end
+
+	----------------------------------------------------------------------------
+	-- Explosions: recorded as they go off (before they hurt anyone), with the
+	-- game's own knockback for them
+	----------------------------------------------------------------------------
+	-- Minetest Game (and games using its tnt mod): tnt.boom. Entities get
+	-- 10 * r / distance m/s, players 2 * r / distance (r: the damage radius).
+	local tnt = rawget(_G, "tnt")
+	if tnt and tnt.boom then
+		local orig = tnt.boom
+		tnt.boom = function(pos, def, ...)
+			if pos then
+				local d = type(def) == "table" and def or {}
+				local r = tonumber(d.damage_radius) or (tonumber(d.radius) or 1) * 2
+				R.blast({pos = pos, radius = r, speed = function(dist, is_player)
+					return is_player and 2 / dist * r or r * 10 / dist
+				end})
+			end
+			return orig(pos, def, ...)
+		end
+		core.log("action", "[ragdoll] hooked tnt.boom")
+	end
+	-- VoxeLibre, MineClone2, Mineclonia: mcl_explosions.explode. Impact * 20
+	-- m/s, impact = 1 - distance / (2 * strength); creatures then slide or
+	-- drag the way that game moves them.
+	local mcl_explosions = rawget(_G, "mcl_explosions")
+	if mcl_explosions and mcl_explosions.explode then
+		local orig = mcl_explosions.explode
+		local mineclonia = mcl_mobs and mcl_mobs.mob_class and mcl_mobs.mob_class.apply_knockback ~= nil
+		mcl_explosions.explode = function(pos, strength, ...)
+			if pos then
+				local r = 2 * (tonumber(strength) or 3)
+				R.blast({pos = pos, radius = r, speed = function(dist, is_player)
+					local impact = math.max(0, 1 - dist / r)
+					return impact * 20, (not is_player) and (mineclonia and "mc" or "voxelibre") or nil
+				end})
+			end
+			return orig(pos, strength, ...)
+		end
+		core.log("action", "[ragdoll] hooked mcl_explosions")
+	end
+	-- Mobs Redo's own explosion (no tnt mod): it only punches, within twice
+	-- the radius; thrown the TNT way.
+	if mobs and mobs.safe_boom then
+		local orig = mobs.safe_boom
+		mobs.safe_boom = function(m, self, pos, radius, ...)
+			if pos and tonumber(radius) then
+				local r = radius * 2
+				R.blast({pos = pos, radius = r, speed = function(dist, is_player)
+					return is_player and 2 / dist * r or r * 10 / dist
+				end})
+			end
+			return orig(m, self, pos, radius, ...)
+		end
 	end
 
 	----------------------------------------------------------------------------
@@ -256,7 +333,7 @@ core.register_on_mods_loaded(function()
 	----------------------------------------------------------------------------
 	for name, def in pairs(core.registered_entities) do
 		local ip = def.initial_properties or def
-		if not name:find("^ragdolls:") and not name:find("^__builtin") and not is_api_mob(def)
+		if not name:find("^ragdoll:") and not name:find("^__builtin") and not is_api_mob(def)
 				and (ip.visual == "mesh" or ip.visual == "cube") and (ip.hp_max or 1) > 1 then
 			local own = rawget(def, "on_death")
 			def.on_death = function(self, killer, ...)

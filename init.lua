@@ -1,4 +1,4 @@
--- Ragdolls: when a player or a mob dies, its body falls as a physics ragdoll
+-- Ragdoll: when a player or a mob dies, its body falls as a physics ragdoll
 -- instead of playing a death animation, tipping over or vanishing.
 --
 -- Works with any skinned model: the bones are read from the model file
@@ -7,21 +7,21 @@
 -- fall as rigid bodies. Hooks for Mobs Redo, mcl_mobs (VoxeLibre, Mineclonia,
 -- MineClone2), mobkit, mob_core, Creatura (Animalia), all_mobs_api, players in
 -- any game, and any other entity the engine kills.
-ragdolls = {}
-local R = ragdolls
+ragdoll = {}
+local R = ragdoll
 local modpath = core.get_modpath(core.get_current_modname())
 
 --------------------------------------------------------------------------------
 -- Settings (re-read every few seconds)
 --------------------------------------------------------------------------------
-local DEFAULTS = {players = true, mobs = true, lifetime = 15, max = 30, despawn = "fade", impulse = 1, spin = 1,
-	flash = true}
+local DEFAULTS = {players = true, mobs = true, lifetime = 15, max = 30, despawn = "fade", impulse = 0.25, spin = 1,
+	flash = true, blast = 1.5}
 local cache, cache_t = {}, -1
 function R.setting(key, default)
 	if cache[key] == nil then
 		local d = DEFAULTS[key]
 		if d == nil then d = default end
-		local raw = core.settings:get("ragdolls_" .. key)
+		local raw = core.settings:get("ragdoll_" .. key)
 		local val = d
 		if raw ~= nil and raw ~= "" then
 			if type(d) == "boolean" then val = core.is_yes(raw)
@@ -77,8 +77,49 @@ local function index_models()
 	end
 end
 
+-- Models with the skeleton once per mesh (a horse's body, saddle and armor;
+-- an overlay layer) get a copy whose extra bones have names of their own, so
+-- the ragdoll can move them all (see models.b3d_aliases). Made at startup and
+-- sent to clients with the rest of the media.
+R.mesh_aliases = {}   -- [mesh] = {mesh = renamed copy, bones = {[bone] = {other names}}}
+local function make_aliases()
+	if not core.dynamic_add_media then return end
+	local meshes = {}
+	for _, def in pairs(core.registered_entities) do
+		local ip = def.initial_properties or def
+		if type(ip.mesh) == "string" then meshes[ip.mesh] = true end
+	end
+	for _, api in ipairs({"player_api", "mcl_player"}) do
+		local t = rawget(_G, api)
+		for name in pairs(type(t) == "table" and type(t.registered_models) == "table" and t.registered_models or {}) do
+			meshes[name] = true
+		end
+	end
+	for mesh in pairs(meshes) do
+		local path = paths[mesh]
+		if path and mesh:lower():match("%.b3d$") then
+			local f = io.open(path, "rb")
+			local data = f and f:read("*a")
+			if f then f:close() end
+			local ok, out, bones = pcall(function()
+				local model = data and R.models.parse_b3d(data)
+				if model then return R.models.b3d_aliases(data, model) end
+			end)
+			if ok and out then
+				local name = "ragdoll_" .. mesh
+				if core.dynamic_add_media({filename = name, filedata = out}) then
+					R.mesh_aliases[mesh] = {mesh = name, bones = bones}
+				end
+			end
+		end
+	end
+end
+
 -- (indexed once everything has loaded, so the first death doesn't hitch)
-core.register_on_mods_loaded(function() if not paths then index_models() end end)
+core.register_on_mods_loaded(function()
+	if not paths then index_models() end
+	make_aliases()
+end)
 
 local rigs = {}
 function R.get_rig(mesh)
@@ -105,9 +146,9 @@ function R.get_rig(mesh)
 			if ok and model then
 				local ok2, r = pcall(R.models.analyze, model)
 				if ok2 and r then rig = r
-				elseif not ok2 then core.log("warning", "[ragdolls] can't rig " .. mesh .. ": " .. tostring(r)) end
+				elseif not ok2 then core.log("warning", "[ragdoll] can't rig " .. mesh .. ": " .. tostring(r)) end
 			elseif not ok then
-				core.log("warning", "[ragdolls] can't read " .. mesh .. ": " .. tostring(model))
+				core.log("warning", "[ragdoll] can't read " .. mesh .. ": " .. tostring(model))
 			end
 		end
 	end
@@ -121,7 +162,7 @@ dofile(modpath .. "/body.lua")
 -- The ragdoll entities
 --------------------------------------------------------------------------------
 local tracked = setmetatable({}, {__mode = "k"})
-core.register_entity("ragdolls:body", {
+core.register_entity("ragdoll:body", {
 	initial_properties = {
 		visual = "mesh", physical = false, pointable = false, collide_with_objects = false,
 		static_save = false, collisionbox = {0, 0, 0, 0, 0, 0}, selectionbox = {0, 0, 0, 0, 0, 0},
@@ -131,8 +172,10 @@ core.register_entity("ragdolls:body", {
 	on_step = function(self)
 		if not tracked[self] and not self.keep then self.object:remove() end
 	end,
+	-- (explosions throw the simulated body, not this object - see R.blast)
+	on_blast = function() return false, false, {} end,
 })
-core.register_entity("ragdolls:part", {
+core.register_entity("ragdoll:part", {
 	initial_properties = {
 		visual = "wielditem", physical = false, pointable = false, collide_with_objects = false,
 		static_save = false, collisionbox = {0, 0, 0, 0, 0, 0}, selectionbox = {0, 0, 0, 0, 0, 0},
@@ -142,6 +185,7 @@ core.register_entity("ragdolls:part", {
 		local p = self.object:get_attach()
 		if not p then self.object:remove() end
 	end,
+	on_blast = function() return false, false, {} end,
 })
 
 local COPY = {"visual", "mesh", "textures", "colors", "visual_size", "use_texture_alpha", "backface_culling", "glow",
@@ -160,33 +204,43 @@ end
 -- Hits: the punch that killed someone pushes the body
 --------------------------------------------------------------------------------
 local player_hits = {}
+-- (kept beside the mobs, not on them: mob APIs save every field of a mob, and
+-- a hit holds the attacker's object)
+local entity_hits = setmetatable({}, {__mode = "k"})
 local function power_of(damage, caps)
 	local d = tonumber(damage) or 0
 	if d <= 0 and caps and caps.damage_groups then d = caps.damage_groups.fleshy or 0 end
 	return math.min(6, 1.5 + math.max(0, d) * 0.2)
 end
-function R.note_hit(target, dir, damage, caps)
+-- (puncher, tflp: optional; they let the game's own knockback be worked out)
+function R.note_hit(target, dir, damage, caps, puncher, tflp)
 	if not dir then return end
-	local rec = {dir = vector.copy(dir), power = power_of(damage, caps), t = core.get_us_time()}
+	local rec = {dir = vector.copy(dir), power = power_of(damage, caps), t = core.get_us_time(),
+		damage = damage, caps = caps, puncher = puncher, tflp = tflp}
 	if target:is_player() then
 		player_hits[target:get_player_name()] = rec
 	else
 		local le = target:get_luaentity()
-		if le then le._ragdolls_hit = rec end
+		if le then entity_hits[le] = rec end
 	end
+	return rec
 end
 local function recent_hit(obj)
 	local rec
 	if obj:is_player() then rec = player_hits[obj:get_player_name()]
 	else
 		local le = obj:get_luaentity()
-		rec = le and le._ragdolls_hit
+		rec = le and entity_hits[le]
 	end
 	if rec and core.get_us_time() - rec.t < 1.5e6 then return rec end
 	return nil
 end
+R.recent_hit = recent_hit
 core.register_on_punchplayer(function(player, hitter, tflp, caps, dir, damage)
-	R.note_hit(player, dir, damage, caps)
+	local rec = R.note_hit(player, dir, damage, caps, hitter, tflp)
+	-- the knockback the game gives players (worked out now: it depends on
+	-- where both stand and what the hitter holds)
+	if rec and R.knockback then rec.kb = R.knockback.player(player, hitter, tflp, caps, dir, damage) end
 end)
 
 --------------------------------------------------------------------------------
@@ -221,6 +275,11 @@ function R.snapshot(obj, opts)
 		snap.texture_mod = strip(snap.texture_mod)
 	end
 	snap.hit = opts.hit or recent_hit(obj)
+	snap.is_player = obj:is_player()
+	-- the game's own knockback for the killing hit (the mob API hooks work it
+	-- out; players get it when they're hit)
+	snap.kb = opts.kb
+	if snap.kb == nil and snap.is_player and snap.hit then snap.kb = snap.hit.kb end
 	snap.profile = (snap.name and R.profiles[snap.name]) or (props.mesh and R.profiles[props.mesh]) or nil
 	-- things attached to it (held items, hats...) come along
 	snap.children = {}
@@ -255,17 +314,21 @@ end
 function R.spawn(snap, source)
 	if not snap or not snap.pos or not snap.props or not visible(snap.props) then return nil end
 	if snap.profile and snap.profile.disable then return nil end
-	local obj = core.add_entity(snap.pos, "ragdolls:body")
+	local obj = core.add_entity(snap.pos, "ragdoll:body")
 	if not obj then return nil end
 	local props = look_of(snap.props)
+	local alias = props.mesh and R.mesh_aliases[props.mesh]
+	if alias then props.mesh = alias.mesh end
 	obj:set_properties(props)
 	if props.visual == "mesh" then
 		local f = (snap.profile and snap.profile.frame) or snap.frame or 0
 		obj:set_animation({x = f, y = f}, 0, 0, false)
 	end
+	-- (a blast that has just gone off nearby threw it)
+	if snap.blasts == nil and R.knockback then snap.blasts = R.knockback.blasts_at(snap.pos) end
 	local ok, b = pcall(R.build, obj, snap)
 	if not ok or not b then
-		core.log("warning", "[ragdolls] couldn't build a ragdoll for " .. tostring(snap.name) .. ": " .. tostring(b))
+		core.log("warning", "[ragdoll] couldn't build a ragdoll for " .. tostring(snap.name) .. ": " .. tostring(b))
 		obj:remove()
 		return nil
 	end
@@ -282,7 +345,7 @@ function R.spawn(snap, source)
 	b.name = snap.name
 	R.add_body(b)
 	for _, c in ipairs(snap.children or {}) do
-		local part = core.add_entity(snap.pos, "ragdolls:part")
+		local part = core.add_entity(snap.pos, "ragdoll:part")
 		if part then
 			part:set_properties(look_of(c.props))
 			part:set_attach(obj, c.bone, c.pos, c.rot, c.fv)
@@ -371,9 +434,9 @@ core.register_on_leaveplayer(function(player)
 	player_hits[player:get_player_name()] = nil
 end)
 
--- /ragdolls: how many bodies and what they cost; /ragdolls clear removes them
+-- /ragdoll: how many bodies and what they cost; /ragdoll clear removes them
 local last_us, last_frames = 0, 0
-core.register_chatcommand("ragdolls", {
+core.register_chatcommand("ragdoll", {
 	params = "[clear]",
 	description = "Ragdoll count and cost (\"clear\" removes them all)",
 	func = function(name, param)
@@ -394,4 +457,5 @@ core.register_chatcommand("ragdolls", {
 	end,
 })
 
+dofile(modpath .. "/knockback.lua")
 dofile(modpath .. "/hooks.lua")

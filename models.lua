@@ -156,7 +156,9 @@ local function parse_b3d(data)
 	end
 
 	read_node = function(parent, stop)
+		local name_pos = pos
 		local name = cstr() or "?"
+		local raw_tf = data:sub(pos, pos + 39)
 		local t = {f32(data, pos), f32(data, pos + 4), f32(data, pos + 8)}
 		local s = {f32(data, pos + 12), f32(data, pos + 16), f32(data, pos + 20)}
 		-- file order w, x, y, z
@@ -164,7 +166,7 @@ local function parse_b3d(data)
 		pos = pos + 40
 		local loc = mat_trs(t, q, s, true)
 		local node = {name = name, parent = parent, children = {}, local_m = loc,
-			global = parent and mat_mul(parent.global, loc) or loc}
+			global = parent and mat_mul(parent.global, loc) or loc, name_pos = name_pos, raw_tf = raw_tf}
 		nodes[#nodes + 1] = node
 		if parent then parent.children[#parent.children + 1] = node end
 		while pos + 8 <= stop do
@@ -177,7 +179,7 @@ local function parse_b3d(data)
 			elseif tag == "MESH" then
 				read_mesh(node, cend)
 			elseif tag == "BONE" then
-				node.bone = true
+				node.bone, node.is_bone = true, true
 				node.weights = node.weights or {}
 				while pos + 8 <= cend do
 					local vid, w = i32(data, pos) + vstart, f32(data, pos + 4)
@@ -202,6 +204,77 @@ local function parse_b3d(data)
 	return {nodes = nodes, verts = verts}
 end
 M.parse_b3d = parse_b3d
+
+-- Some models have the skeleton once per mesh (body, saddle, armor, an overlay
+-- layer), every copy with the same bone names. The engine moves only the first
+-- bone of a name, so the ragdoll uses a copy of the model where the other
+-- copies' bones get names of their own (same length: the first byte becomes
+-- \1, \2...), and moves them all together.
+-- Returns the renamed file data and {[bone name] = {other names}}, or nil.
+local function same_bone(a, b)
+	if a.raw_tf and b.raw_tf then
+		if a.raw_tf ~= b.raw_tf then return false end
+	else
+		for i = 1, 16 do
+			if math.abs((a.global[i] or 0) - (b.global[i] or 0)) > 1e-4 then return false end
+		end
+	end
+	-- (is_bone: what the file says, whatever merging did since)
+	local function up(n)
+		n = n.parent
+		while n and not (n.is_bone or n.bone) do n = n.parent end
+		return n
+	end
+	local pa, pb = up(a), up(b)
+	if not pa or not pb then return pa == pb end
+	return pa.name == pb.name
+end
+function M.b3d_aliases(data, model)
+	local first, copies, names = {}, {}, {}
+	for _, n in ipairs(model.nodes) do names[n.name] = true end
+	local any = false
+	for _, n in ipairs(model.nodes) do
+		if n.bone then
+			local f = first[n.name]
+			if not f then first[n.name] = n
+			elseif same_bone(f, n) and #n.name > 0 then
+				copies[n.name] = copies[n.name] or {}
+				local list = copies[n.name]
+				list[#list + 1] = n
+				any = true
+			end
+		end
+	end
+	if not any then return nil end
+	local parts, last = {}, 1
+	local patches = {}
+	local aliases = {}
+	for name, list in pairs(copies) do
+		for k, n in ipairs(list) do
+			local alias
+			for _, at in ipairs({1, #name}) do
+				local a = name:sub(1, at - 1) .. string.char(k % 31 + 1) .. name:sub(at + 1)
+				if not names[a] then alias = a break end
+			end
+			if alias then
+				names[alias] = true
+				patches[#patches + 1] = {n.name_pos, alias}
+				aliases[name] = aliases[name] or {}
+				table.insert(aliases[name], alias)
+			end
+		end
+	end
+	table.sort(patches, function(a, b) return a[1] < b[1] end)
+	for _, p in ipairs(patches) do
+		parts[#parts + 1] = data:sub(last, p[1] - 1)
+		parts[#parts + 1] = p[2]
+		last = p[1] + #p[2]
+	end
+	parts[#parts + 1] = data:sub(last)
+	local out = table.concat(parts)
+	if #out ~= #data then return nil end
+	return out, aliases
+end
 
 --------------------------------------------------------------------------------
 -- .gltf / .glb (skinned meshes: joints, their rest pose and vertex weights)
@@ -349,7 +422,7 @@ local function parse_gltf(data, json_parse, dir_reader)
 								local jn = skin.joints[(J[k][c] or 0) + 1]
 								if w and w > 0 and jn and built[jn + 1] then
 									local bn = built[jn + 1]
-									bn.bone = true
+									bn.bone, bn.is_bone = true, true
 									bn.weights = bn.weights or {}
 									bn.weights[vstart + k - 1] = w
 								end
@@ -362,7 +435,7 @@ local function parse_gltf(data, json_parse, dir_reader)
 	end
 	for _, skin in ipairs(doc.skins or {}) do
 		for _, j in ipairs(skin.joints or {}) do
-			if built[j + 1] then built[j + 1].bone = true end
+			if built[j + 1] then built[j + 1].bone, built[j + 1].is_bone = true, true end
 		end
 	end
 	return {nodes = nodes, verts = verts}
@@ -429,6 +502,25 @@ function M.analyze(model)
 	local size = vlen(vsub(bmax, bmin))
 	local rig = {bounds = {min = bmin, max = bmax}, limbs = {}, core = {}}
 	local elongation
+
+	-- the skeleton once per mesh (see b3d_aliases): one bone per name, moving
+	-- everything any of its copies moves
+	do
+		local first = {}
+		for _, n in ipairs(model.nodes) do
+			if n.bone then
+				local f = first[n.name]
+				if not f then first[n.name] = n
+				elseif same_bone(f, n) then
+					f.weights = f.weights or {}
+					for vid, w in pairs(n.weights or {}) do
+						if not f.weights[vid] or w > f.weights[vid] then f.weights[vid] = w end
+					end
+					n.bone = false   -- (the parsed model is only used for this)
+				end
+			end
+		end
+	end
 
 	-- every vertex goes to the bone that moves it most
 	local owner = {}

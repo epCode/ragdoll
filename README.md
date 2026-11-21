@@ -1,4 +1,4 @@
-# Ragdolls
+# Ragdoll
 
   When a player or a mob dies, its body falls as a physics ragdoll. This replaces
 the death animation, the tipping over, the fading or the vanishing it would
@@ -18,12 +18,26 @@ rigid bodies.
 | mob_core | `mob_core.on_die` is replaced. Drops and the death sound still run. |
 | Creatura (Animalia and others) | Animalia's die utility is replaced. Any other Creatura mob that falls over gets a ragdoll, and its real body is hidden. |
 
-The killing punch decides which way the body goes and how hard. It is recorded
-for every entity and player.
+The killing hit throws the body the way the game's own knockback would have
+thrown the creature, and about as far: each mob API's formula is worked out
+for that hit (weapon, enchantments, a running attacker, how charged the swing
+was), along with how far that API's movement would have carried it. Players
+get the game's `core.calculate_knockback`, overrides included. Mobs with no
+knockback of their own get a push from the damage. By default bodies go a
+quarter as far and as high as that (`ragdoll_impulse` = 0.25; at 1 they get
+the game's full knockback - VoxeLibre throws killed mobs about 18 nodes, and
+much further with Knockback enchantments, up to a 60 m/s cap).
+
+Explosions throw bodies too, both the ones they kill and the ones already
+lying around, with the game's own blast knockback: Minetest Game's
+`tnt.boom`, `mcl_explosions` (VoxeLibre, MineClone2, Mineclonia) and Mobs
+Redo's explosions. By default half again as hard as the game's own blast
+(`ragdoll_blast` = 1.5; at 1, the game's full blast). Before scaling, a body
+stops at 25 m/s.
 
 
-`/ragdolls` shows how many bodies there are and what they cost.
-`/ragdolls clear` removes them all (needs the `server` privilege).
+`/ragdoll` shows how many bodies there are and what they cost.
+`/ragdoll clear` removes them all (needs the `server` privilege).
 
 ## For modders
 
@@ -32,8 +46,8 @@ for every entity and player.
 _ragdoll = false
 
 -- Or from another mod, by entity name or mesh file:
-ragdolls.exclude("mymod:boss")
-ragdolls.register_profile("mymod:golem", {
+ragdoll.exclude("mymod:boss")
+ragdoll.register_profile("mymod:golem", {
 	rigid_only = true,                 -- fall as one stiff body
 	skip_bones = {Antenna = true},     -- don't flop these
 	max_angle = {Head = 0.4},          -- how far a limb may swing (radians)
@@ -42,18 +56,23 @@ ragdolls.register_profile("mymod:golem", {
 
 -- Make a ragdoll yourself (the object must still exist). Do it before your
 -- death code changes the object, then remove the object:
-ragdolls.spawn_from(obj, {hit = {dir = dir, power = 4}})
+ragdoll.spawn_from(obj, {hit = {dir = dir, power = 4}})
 -- or in two steps:
-local snap = ragdolls.snapshot(obj, {frame = 0, texture_mod = "", strip = "^[colorize:#ff0000:100"})
+local snap = ragdoll.snapshot(obj, {frame = 0, texture_mod = "", strip = "^[colorize:#ff0000:100"})
 obj:remove()
-ragdolls.spawn(snap)
+ragdoll.spawn(snap)
 
 -- A game with its own player deaths can turn the player hook off:
-ragdolls.players_disabled = true
+ragdoll.players_disabled = true
 
-ragdolls.register_on_spawn(function(ragdoll, snapshot, source) end)
-ragdolls.body_pos(ragdoll)                 -- where the body is (e.g. for death cams)
-ragdolls.hide_player(player); ragdolls.show_player(player)
+-- Your own explosion: throws the bodies around it, and the bodies of whatever
+-- it kills in the next moment (power: m/s one node away, less further out).
+-- Call it just before the explosion hurts anything:
+ragdoll.blast({pos = pos, radius = 5, power = 20})
+
+ragdoll.register_on_spawn(function(body, snapshot, source) end)
+ragdoll.body_pos(body)                    -- where the body is (e.g. for death cams)
+ragdoll.hide_player(player); ragdoll.show_player(player)
 ```
 ## Limits
 
